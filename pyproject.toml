@@ -1,0 +1,75 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pulse-agent-sdk"
+version = "0.1.0"
+description = "Python SDK for building Pulse Agent Apps"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = ["httpx>=0.26,<1"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Typing :: Typed",
+]
+keywords = ["pulse", "agent", "sdk", "oauth", "webhooks"]
+
+[project.optional-dependencies]
+dev = [
+  "mypy>=1.19,<3",
+  "pytest>=8,<10",
+  "pytest-asyncio>=1,<2",
+  "PyYAML>=6,<7",
+  "ruff>=0.11,<1",
+  "types-PyYAML>=6,<7",
+]
+release = [
+  "build>=1.2,<2",
+  "packaging>=24,<27",
+  "twine>=6,<8",
+]
+
+[project.urls]
+Documentation = "https://trypulse.tech/docs/developers/agents"
+Repository = "https://github.com/try-pulse/pulse-agent-sdk-python"
+Issues = "https://github.com/try-pulse/pulse-agent-sdk-python/issues"
+Changelog = "https://github.com/try-pulse/pulse-agent-sdk-python/blob/main/CHANGELOG.md"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pulse_agent_sdk"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "/src", "/tests", "/fixtures", "/specs", "/scripts", "/docs", "/examples",
+  "/CHANGELOG.md", "/CONTRIBUTING.md", "/LICENSE", "/Makefile", "/README.md", "/SECURITY.md", "/pyproject.toml",
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["pulse_agent_sdk"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/pulse_agent_sdk/_generated_api.py" = ["E741"] # The upstream logo field is named l.
+
+[tool.mypy]
+strict = true
+files = ["src", "examples", "scripts"]
