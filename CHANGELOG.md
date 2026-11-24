@@ -1,8 +1,13 @@
 # Changelog
 
+## 0.1.1
+
+First PyPI release. Updates Trusted Publishing to support core metadata 2.5 and
+validates distributions in CI with the same Twine and packaging versions as the publisher.
+
 ## 0.1.0
 
-First public Python SDK release for Pulse Agent Apps.
+Initial GitHub beta for Pulse Agent Apps.
 
 - Async OAuth installation with S256 PKCE, shared refresh locking, revocation handling, and credential-operation draining.
 - Signed webhook verification, post-ack callbacks, durable inbox intake and restart-safe event restoration, scoped deduplication, Stop signals, and permission events.
