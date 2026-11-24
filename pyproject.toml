@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pulse-agent-sdk"
-version = "0.1.0"
+version = "0.1.1"
 description = "Python SDK for building Pulse Agent Apps"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -36,7 +36,7 @@ dev = [
 release = [
   "build>=1.2,<2",
   "packaging>=24,<27",
-  "twine>=6,<8",
+  "twine>=7,<8",
 ]
 
 [project.urls]
