@@ -16,9 +16,11 @@ import httpx
 
 from pulse_agent_sdk import (
     AgentAppAuth,
+    InstallationRevokedError,
     MemoryAuthStore,
     OAuthConfig,
     PulseAgentClient,
+    SessionEndedError,
     WebhookEvent,
     WebhookReceiver,
 )
@@ -49,7 +51,11 @@ class Inbox:
     async def drain(self, auth: AgentAppAuth) -> None:
         rows = self.db.execute("SELECT id, payload FROM inbox WHERE processed = 0 ORDER BY id").fetchall()
         for row_id, payload in rows:
-            await answer(auth, WebhookEvent.from_verified_payload(json.loads(payload)))
+            try:
+                await answer(auth, WebhookEvent.from_verified_payload(json.loads(payload)))
+            except (SessionEndedError, InstallationRevokedError):
+                # These outcomes settle this row even if later rows are still actionable.
+                pass
             with self.db:
                 self.db.execute("UPDATE inbox SET processed = 1 WHERE id = ?", (row_id,))
 

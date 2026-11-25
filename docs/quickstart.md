@@ -1,6 +1,6 @@
 # Python quickstart
 
-Install the SDK with `python -m pip install pulse-agent-sdk` after the PyPI release, or install the built wheel. Use Python 3.11–3.14.
+Install the public SDK with `python -m pip install pulse-agent-sdk` in a Python 3.11–3.14 environment. For local release verification, install the wheel from the release preparation directory.
 
 From a checkout or unpacked sdist, run `python examples/scout.py` for a complete offline run. It exchanges a mocked OAuth code, verifies signed deliveries, commits them to a SQLite inbox, and answers a delegation and Stop. You should see a thought, an issue summary, and `Stopped.`
 

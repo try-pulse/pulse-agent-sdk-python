@@ -8,6 +8,14 @@ on:
         type: boolean
         required: true
         default: false
+      wheel_sha256:
+        description: Approved wheel SHA-256 (required for publishing)
+        type: string
+        required: false
+      sdist_sha256:
+        description: Approved sdist SHA-256 (required for publishing)
+        type: string
+        required: false
 
 permissions:
   contents: read
@@ -41,6 +49,19 @@ jobs:
         with:
           name: sdk-distributions
           path: dist
+      - name: Verify approved distribution digests
+        env:
+          WHEEL_SHA256: ${{ inputs.wheel_sha256 }}
+          SDIST_SHA256: ${{ inputs.sdist_sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$WHEEL_SHA256" =~ ^[a-f0-9]{64}$ && "$SDIST_SHA256" =~ ^[a-f0-9]{64}$ ]]
+          wheels=(dist/*.whl)
+          sources=(dist/*.tar.gz)
+          files=(dist/*)
+          [[ ${#wheels[@]} -eq 1 && ${#sources[@]} -eq 1 && ${#files[@]} -eq 2 ]]
+          printf '%s  %s\n' "$WHEEL_SHA256" "${wheels[0]}" "$SDIST_SHA256" "${sources[0]}" | sha256sum -c -
       - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
         with:
           packages-dir: dist/
