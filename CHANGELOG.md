@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.3
+
+Refresh the Pulse API types for issue messaging intake, team moves, issue type and blocking relationships.
+
 ## 0.1.2
 
 - Deliver distinct prompts in callback mode even when they arrive out of order or share a timestamp.
