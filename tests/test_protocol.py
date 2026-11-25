@@ -7,8 +7,11 @@ import base64
 import hashlib
 import hmac
 import json
+import sqlite3
 import time
 from collections.abc import AsyncIterator, Callable
+from contextlib import closing
+from dataclasses import replace
 from email.utils import formatdate
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,6 +21,7 @@ from urllib.parse import parse_qs, urlsplit
 import httpx
 import pytest
 
+from examples import scout
 from pulse_agent_sdk import (
     AgentAppAuth,
     InstallationRevokedError,
@@ -314,6 +318,263 @@ async def test_callback_handler_acks_first_dedupes_and_stops_the_running_signal(
     assert (await signals[0].wait()).kind == "stop_signal"
 
 
+def session_delivery(occurrence, created_at, *, stop=False, action="prompted", offset=0, session="session"):
+    raw, _ = signed_webhook(offset=offset)
+    payload = json.loads(raw)
+    payload["action"] = action
+    if created_at is None:
+        del payload["created_at"]
+    else:
+        payload["created_at"] = created_at
+    payload["data"]["event_id"] = occurrence
+    payload["data"]["agent_session"]["id"] = session
+    if not stop:
+        payload["data"]["agent_activity"].pop("signal")
+        payload["data"]["agent_activity"]["content"]["body"] = f"Prompt {occurrence}"
+    return sign(payload)
+
+
+@pytest.mark.parametrize("same_time", [False, True])
+@pytest.mark.parametrize("reverse_claims", [False, True])
+async def test_callback_delivers_distinct_ordinary_prompts(same_time, reverse_claims):
+    old_claim = asyncio.Event()
+    finish_old = asyncio.Event()
+    new_callback = asyncio.Event()
+    claimed = set()
+    callbacks = []
+
+    class Dedupe:
+        async def claim(self, key):
+            if key in claimed:
+                return False
+            claimed.add(key)
+            if json.loads(key)[1] == "old":
+                old_claim.set()
+                await finish_old.wait()
+            return True
+
+    def prompted(event, context):
+        assert not context.is_stop and not context.signal.aborted
+        callbacks.append((event.event_id, event.data["agent_activity"]["content"]["body"]))
+        if event.event_id == "new":
+            new_callback.set()
+
+    handler = WebhookHandler("fixture-secret", dedupe=Dedupe() if reverse_claims else None, on_session_prompted=prompted)
+    later = "2026-11-24T08:00:02.000Z"
+    earlier = later if same_time else "2026-11-24T08:00:01.000Z"
+    if reverse_claims:
+        assert handler.handle(*session_delivery("old", earlier)) == (200, {"ok": True})
+        assert not old_claim.is_set()
+        await asyncio.wait_for(old_claim.wait(), timeout=1)
+    assert handler.handle(*session_delivery("new", later)) == (200, {"ok": True})
+    assert callbacks == []
+    if not reverse_claims:
+        assert handler.handle(*session_delivery("old", earlier)) == (200, {"ok": True})
+        assert callbacks == []
+    await asyncio.wait_for(new_callback.wait(), timeout=1)
+    finish_old.set()
+    await handler.idle()
+    assert handler.handle(*session_delivery("old", earlier, offset=10_000)) == (200, {"ok": True})
+    await handler.idle()
+    assert callbacks == [("new", "Prompt new"), ("old", "Prompt old")]
+
+
+@pytest.mark.parametrize("first", ["old", "stop"])
+async def test_callback_stop_survives_reverse_dedupe_completion_and_redelivery(first):
+    keys = (first, "stop" if first == "old" else "old")
+    entered = {key: asyncio.Event() for key in keys}
+    finished = {key: asyncio.Event() for key in keys}
+    proceed = {key: asyncio.Event() for key in keys}
+    claims = {}
+    callbacks = []
+
+    class Dedupe:
+        async def claim(self, key):
+            _, occurrence = json.loads(key)
+            claims[occurrence] = claims.get(occurrence, 0) + 1
+            if occurrence in entered and claims[occurrence] == 1:
+                entered[occurrence].set()
+                await proceed[occurrence].wait()
+                finished[occurrence].set()
+            return claims[occurrence] == 1
+
+    handler = WebhookHandler(
+        "fixture-secret", dedupe=Dedupe(),
+        on_session_created=lambda event, ctx: callbacks.append((event.event_id, ctx.signal.aborted)),
+        on_session_prompted=lambda event, ctx: callbacks.append((event.event_id, ctx.signal.aborted)),
+    )
+    older = "2026-11-24T08:00:00.000Z"
+    stop_time = "2026-11-24T08:00:01.000Z"
+    deliveries = {"old": session_delivery("old", older), "stop": session_delivery("stop", stop_time, stop=True)}
+    original = handler.stops.signal("session")
+    for key in keys:
+        assert handler.handle(*deliveries[key]) == (200, {"ok": True})
+        assert not entered[key].is_set()
+        await asyncio.wait_for(entered[key].wait(), timeout=1)
+    proceed[keys[1]].set()
+    await asyncio.wait_for(finished[keys[1]].wait(), timeout=1)
+    interim_callbacks = list(callbacks)
+    proceed[keys[0]].set()
+    await handler.idle()
+    assert interim_callbacks == ([("stop", True)] if keys[1] == "stop" else [])
+    assert callbacks == [("stop", True)]
+    assert original.aborted
+
+    for event in (
+        session_delivery("old", older, offset=10_000),
+        session_delivery("older-after-stop", older, offset=10_000),
+        session_delivery("tie", stop_time),
+        session_delivery("unknown", None),
+        session_delivery("created-late", "2026-11-24T08:00:02.000Z", action="created"),
+    ):
+        assert handler.handle(*event)[0] == 200
+    await handler.idle()
+    assert callbacks == [("stop", True)]
+    assert handler.stops.signal("session") is original
+
+    handler.stops.release("session")
+    assert handler.handle(*session_delivery("released-stale", older))[0] == 200
+    await handler.idle()
+    assert callbacks == [("stop", True)]
+    assert handler.handle(*session_delivery("new", "2026-11-24T08:00:03.000Z"))[0] == 200
+    await handler.idle()
+    assert callbacks == [("stop", True), ("new", False)]
+    assert original.aborted and not handler.stops.is_stopped("session")
+    for delivery in (
+        session_delivery("stale-stop", stop_time, stop=True),
+        session_delivery("pre-stop-after-reopening", older),
+        session_delivery("tie-after-reopening", stop_time),
+        session_delivery("undated-after-reopening", None),
+        session_delivery("post-stop-out-of-order", "2026-11-24T08:00:02.000Z"),
+    ):
+        assert handler.handle(*delivery)[0] == 200
+    await handler.idle()
+    assert callbacks == [("stop", True), ("new", False), ("post-stop-out-of-order", False)]
+    assert not handler.stops.is_stopped("session")
+
+
+async def test_callback_late_stop_fences_delayed_work_without_cancelling_newer_run():
+    callbacks = []
+    handler = WebhookHandler(
+        "fixture-secret", on_session_prompted=lambda event, ctx: callbacks.append((event.event_id, ctx.signal)),
+    )
+    stop_time = "2026-11-24T08:00:02.000Z"
+    assert handler.handle(*session_delivery("new", "2026-11-24T08:00:04.000Z"))[0] == 200
+    await handler.idle()
+    for delivery in (
+        session_delivery("late-stop", stop_time, stop=True),
+        session_delivery("old", "2026-11-24T08:00:01.000Z"),
+        session_delivery("tie", stop_time),
+        session_delivery("post-stop", "2026-11-24T08:00:03.000Z"),
+    ):
+        assert handler.handle(*delivery)[0] == 200
+    await handler.idle()
+    assert [key for key, _ in callbacks] == ["new", "post-stop"]
+    assert callbacks[0][1] is callbacks[1][1] and not callbacks[0][1].aborted
+    assert handler.handle(*session_delivery("tie-with-work", "2026-11-24T08:00:04.000Z", stop=True))[0] == 200
+    await handler.idle()
+    assert [key for key, _ in callbacks] == ["new", "post-stop", "tie-with-work"]
+    assert callbacks[0][1].aborted
+
+
+async def test_callback_undated_work_is_allowed_until_stop():
+    callbacks = []
+    handler = WebhookHandler("fixture-secret", on_session_prompted=lambda event, ctx: callbacks.append(event.event_id))
+    assert handler.handle(*session_delivery("dated", "2026-11-24T08:00:01.000Z"))[0] == 200
+    await handler.idle()
+    assert handler.handle(*session_delivery("undated", None))[0] == 200
+    await handler.idle()
+    assert callbacks == ["dated", "undated"]
+
+
+@pytest.mark.parametrize("missing", [None, "not a timestamp", "2026-11-24T08:00:00"])
+async def test_callback_undated_stop_stays_stopped(missing):
+    callbacks = []
+    handler = WebhookHandler(
+        "fixture-secret", on_session_prompted=lambda _, ctx: callbacks.append(ctx.is_stop),
+    )
+    assert handler.handle(*session_delivery("stop", missing, stop=True))[0] == 200
+    await handler.idle()
+    assert handler.handle(*session_delivery("new", "2026-11-24T08:00:03.000Z"))[0] == 200
+    await handler.idle()
+    assert callbacks == [True]
+    assert handler.stops.is_stopped("session")
+
+
+async def test_callback_order_capacity_keeps_stop_and_reclaims_idle_sessions(monkeypatch):
+    now = 0.0
+    monkeypatch.setattr("pulse_agent_sdk.handler.monotonic", lambda: now)
+    claims = []
+    callbacks = []
+
+    class Dedupe:
+        def claim(self, key):
+            claims.append(json.loads(key)[1])
+            return True
+
+    handler = WebhookHandler(
+        "fixture-secret", dedupe=Dedupe(), max_ordered_sessions=2,
+        on_session_prompted=lambda event, ctx: callbacks.append((event.event_id, ctx.signal.aborted)),
+    )
+    older = "2026-11-24T08:00:00.000Z"
+    stop_time = "2026-11-24T08:00:01.000Z"
+    assert handler.handle(*session_delivery("stop", stop_time, stop=True))[0] == 200
+    assert handler.handle(*session_delivery("idle", older, session="idle"))[0] == 200
+    await handler.idle()
+    handler.stops.release("session")
+
+    now = 86_399
+    overflow = session_delivery("overflow", older, session="overflow")
+    assert handler.handle(*overflow) == (503, {"ok": False, "error": "session_order_capacity"})
+    assert handler.handle(*session_delivery("fenced", older))[0] == 200
+    await handler.idle()
+    assert claims == ["stop", "idle", "fenced"]
+    assert callbacks == [("stop", True), ("idle", False)]
+
+    now = 86_400
+    assert handler.handle(*overflow)[0] == 200
+    await handler.idle()
+    assert callbacks[-1] == ("overflow", False)
+    assert handler.handle(*session_delivery("still-fenced", older))[0] == 200
+    await handler.idle()
+    assert callbacks[-1] == ("overflow", False)
+
+    now = 172_800
+    assert handler.handle(*session_delivery("after-expiry", older))[0] == 200
+    await handler.idle()
+    assert callbacks[-1] == ("after-expiry", False)
+
+
+async def test_callback_order_does_not_expire_while_dedupe_is_pending(monkeypatch):
+    now = 0.0
+    monkeypatch.setattr("pulse_agent_sdk.handler.monotonic", lambda: now)
+    stop_entered = asyncio.Event()
+    stop_ready = asyncio.Event()
+    callbacks = []
+
+    class Dedupe:
+        async def claim(self, key):
+            if json.loads(key)[1] == "stop":
+                stop_entered.set()
+                await stop_ready.wait()
+            return True
+
+    handler = WebhookHandler(
+        "fixture-secret", max_ordered_sessions=1, dedupe=Dedupe(),
+        on_session_prompted=lambda event, ctx: callbacks.append((event.event_id, ctx.signal.aborted)),
+    )
+    older = "2026-11-24T08:00:00.000Z"
+    assert handler.handle(*session_delivery("stop", "2026-11-24T08:00:01.000Z", stop=True))[0] == 200
+    await asyncio.wait_for(stop_entered.wait(), timeout=1)
+    now = 86_401
+    assert handler.handle(*session_delivery("untracked", older, session="other"))[0] == 503
+    assert handler.handle(*session_delivery("fenced", older))[0] == 200
+    stop_ready.set()
+    await handler.idle()
+    assert callbacks == [("stop", True)]
+    assert handler.stops.is_stopped("session")
+
+
 async def test_activity_retries_keep_the_same_key_and_401_refreshes_once(make_auth):
     activities = []
 
@@ -412,9 +673,13 @@ async def test_session_activity_cursor_and_signal_shapes(make_auth):
 
 
 async def test_revoked_api_response_forgets_grant_and_stops_work(make_auth):
-    auth = await make_auth(
-        lambda _: httpx.Response(401, json={"code": "INSTALLATION_REVOKED"}), existing=True,
-    )
+    requests = []
+
+    def exchange(request):
+        requests.append(request)
+        return httpx.Response(401, json={"code": "INSTALLATION_REVOKED"})
+
+    auth = await make_auth(exchange, existing=True)
     raw, headers = signed_webhook()
     event = verify_webhook(raw, headers, "fixture-secret")
     stops = SessionStops()
@@ -424,6 +689,120 @@ async def test_revoked_api_response_forgets_grant_and_stops_work(make_auth):
         await client.me()
     assert await auth.store.get_tokens("install") is None
     assert signal.cause is not None and signal.cause.kind == "revoked"
+    assert len(requests) == 1
+
+
+@pytest.mark.parametrize("different_identity", [False, True])
+async def test_obsolete_revocation_checks_identity_and_keeps_activity_key(make_auth, different_identity):
+    requests = []
+    entered = asyncio.Event()
+    proceed = asyncio.Event()
+
+    async def exchange(request):
+        requests.append(request)
+        if request.headers["Authorization"] == "Bearer old-access":
+            entered.set()
+            await proceed.wait()
+            return httpx.Response(401, json={"code": "INSTALLATION_REVOKED"})
+        return httpx.Response(201, json={"id": "activity"})
+
+    auth = await make_auth(exchange, existing=True)
+    stops = SessionStops()
+    signal = stops.signal("session", "install")
+    client = PulseAgentClient(auth, "install", stops=stops)
+    pending = asyncio.create_task(client.respond("session", "Done", idempotency_key="original-key"))
+    await asyncio.wait_for(entered.wait(), timeout=1)
+    async with auth.store.lock_installation("install"):
+        record = await auth.installation("install")
+        replacement = replace(
+            record, access_token="new-access", refresh_token="new-refresh",
+            app_user_id="other-app" if different_identity else record.app_user_id,
+        )
+        await auth.store.put_tokens(replacement)
+    proceed.set()
+    if different_identity:
+        with pytest.raises(PermissionError):
+            await pending
+        assert len(requests) == 1
+    else:
+        assert await pending == {"id": "activity"}
+        assert [request.headers["Authorization"] for request in requests] == ["Bearer old-access", "Bearer new-access"]
+        assert [request.headers["Idempotency-Key"] for request in requests] == ["original-key"] * 2
+        assert requests[0].content == requests[1].content
+    assert await auth.installation("install") == replacement
+    assert not signal.aborted
+
+
+async def test_obsolete_revocation_recovery_is_bounded(make_auth):
+    requests = []
+
+    async def exchange(request):
+        requests.append(request)
+        async with auth.store.lock_installation("install"):
+            record = await auth.installation("install")
+            await auth.store.put_tokens(replace(record, access_token=f"replacement-{len(requests)}"))
+        return httpx.Response(401, json={"code": "INSTALLATION_REVOKED"})
+
+    auth = await make_auth(exchange, existing=True)
+    stops = SessionStops()
+    signal = stops.signal("session", "install")
+    client = PulseAgentClient(auth, "install", stops=stops)
+    with pytest.raises(PulseApiError, match="credential_replaced"):
+        await client.me()
+    assert [request.headers["Authorization"] for request in requests] == ["Bearer old-access", "Bearer replacement-1"]
+    assert (await auth.installation("install")).access_token == "replacement-2"
+    assert not signal.aborted
+
+
+@pytest.mark.parametrize("terminal", ["ended", "revoked"])
+async def test_scout_settles_terminal_inbox_rows_and_answers_healthy_once(make_auth, terminal):
+    calls = []
+
+    def exchange(request):
+        path = request.url.path.removeprefix("/api/v1")
+        calls.append(path)
+        if "/terminal/" in path:
+            if terminal == "ended":
+                return httpx.Response(409, json={"code": "SESSION_ENDED"})
+            return httpx.Response(401, json={"code": "INSTALLATION_REVOKED"})
+        return httpx.Response(201, json={"id": "activity"})
+
+    auth = await make_auth(exchange, existing=True)
+    await auth.store.put_tokens(replace(await auth.installation("install"), installation_id="healthy"))
+    raw, _ = signed_webhook()
+    payload = json.loads(raw)
+    with closing(sqlite3.connect(":memory:")) as db:
+        inbox = scout.Inbox(db)
+        payload["data"]["agent_session"]["id"] = "terminal"
+        await inbox.enqueue(WebhookEvent.from_verified_payload(payload))
+        payload["installation_id"] = "healthy"
+        payload["data"]["agent_session"]["id"] = "healthy"
+        await inbox.enqueue(WebhookEvent.from_verified_payload(payload))
+        await inbox.drain(auth)
+        await inbox.drain(auth)
+        assert db.execute("SELECT processed FROM inbox ORDER BY id").fetchall() == [(1,), (1,)]
+    assert calls == ["/agent-sessions/terminal/activities", "/agent-sessions/healthy/activities"]
+
+
+async def test_scout_transient_failure_keeps_row_eligible_for_retry(make_auth):
+    calls = []
+
+    def exchange(request):
+        calls.append(request.headers["Idempotency-Key"])
+        if len(calls) == 1:
+            return httpx.Response(503, headers={"Retry-After": "61"})
+        return httpx.Response(201, json={"id": "activity"})
+
+    auth = await make_auth(exchange, existing=True)
+    with closing(sqlite3.connect(":memory:")) as db:
+        inbox = scout.Inbox(db)
+        await inbox.enqueue(verify_webhook(*signed_webhook(), "fixture-secret"))
+        with pytest.raises(PulseApiError, match="HTTP_503"):
+            await inbox.drain(auth)
+        assert db.execute("SELECT processed FROM inbox").fetchone() == (0,)
+        await inbox.drain(auth)
+        assert db.execute("SELECT processed FROM inbox").fetchone() == (1,)
+    assert len(calls) == 2 and calls[0] == calls[1]
 
 
 async def test_oauth_rejects_refresh_without_rotation(make_auth):
@@ -529,6 +908,7 @@ async def test_permission_and_revocation_callbacks_and_stop_resume():
     assert signal.aborted
     prompted["data"]["event_id"] = "human"
     prompted["data"]["agent_activity"].pop("signal")
+    prompted["created_at"] = "2026-11-24T08:00:01.000Z"
     assert handler.handle(*sign(prompted))[0] == 200
     await handler.idle()
     next_signal = stops.signal("session")

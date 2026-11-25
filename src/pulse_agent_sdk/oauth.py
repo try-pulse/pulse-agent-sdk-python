@@ -71,6 +71,10 @@ class InstallationTokens:
     expires_at: float  # Unix seconds.
     scope: str = ""
 
+    @property
+    def _identity(self) -> tuple[str, str, str]:
+        return self.installation_id, self.workspace_id, self.app_user_id
+
 
 @dataclass(frozen=True, slots=True)
 class PendingInstall:
@@ -208,9 +212,16 @@ class AgentAppAuth:
         return record
 
     async def get_access_token(self, installation_id: str, *, rejected_token: str | None = None) -> str:
-        record = await self._record_for_installation(installation_id)
+        record = await self._get_access_record(installation_id, rejected_token=rejected_token)
+        return record.access_token
+
+    async def _get_access_record(
+        self, installation_id: str, *, rejected_token: str | None,
+        identity: tuple[str, str, str] | None = None,
+    ) -> InstallationTokens:
+        record = await self._record_for_installation(installation_id, identity)
         if self._usable(record, rejected_token):
-            return record.access_token
+            return record
 
         # Pulse can rotate the token before we receive the response. A cancelled API
         # call must still let this task finish persisting the new credential pair.
@@ -219,8 +230,7 @@ class AgentAppAuth:
             task = self._start(self._refresh(record, rejected_token))
             self._refreshing[record] = task
             task.add_done_callback(lambda _: self._refreshing.pop(record, None))
-        refreshed = await asyncio.shield(task)
-        return refreshed.access_token
+        return await asyncio.shield(task)
 
     async def drain(self) -> None:
         """Wait for outstanding credential operations before closing the HTTP client."""
@@ -241,16 +251,13 @@ class AgentAppAuth:
             if record is not None and record.workspace_id == self.config.workspace_id:
                 await self.store.put_tokens(replace(record, expires_at=0))
 
-    async def _forget_rejected_token(self, installation_id: str, rejected_token: str) -> bool:
+    async def _check_revoked_credential(self, refused: InstallationTokens) -> None:
+        installation_id = refused.installation_id
         async with self.store.lock_installation(installation_id):
-            record = await self.store.get_tokens(installation_id)
-            if (
-                record is not None and record.workspace_id == self.config.workspace_id
-                and record.access_token == rejected_token
-            ):
+            record = await self._record_for_installation(installation_id, refused._identity)
+            if record.access_token == refused.access_token:
                 await self.store.delete_tokens(installation_id)
-                return True
-            return False
+                raise InstallationRevokedError(installation_id)
 
     async def installation(self, installation_id: str) -> InstallationTokens:
         """Get the stored installation identity and token record for this workspace."""
@@ -285,8 +292,12 @@ class AgentAppAuth:
         if not task.cancelled():
             task.exception()
 
-    async def _record_for_installation(self, installation_id: str) -> InstallationTokens:
+    async def _record_for_installation(
+        self, installation_id: str, identity: tuple[str, str, str] | None = None,
+    ) -> InstallationTokens:
         record = await self.store.get_tokens(installation_id)
+        if record is not None and identity is not None and record._identity != identity:
+            raise PermissionError("Pulse installation identity changed")
         if record is None or record.workspace_id != self.config.workspace_id or record.installation_id != installation_id:
             raise InstallationRevokedError(installation_id)
         return record
@@ -301,7 +312,7 @@ class AgentAppAuth:
     ) -> InstallationTokens:
         installation_id = observed.installation_id
         async with self.store.lock_installation(installation_id):
-            record = await self._record_for_installation(installation_id)
+            record = await self._record_for_installation(installation_id, observed._identity)
             if self._usable(record, rejected_token) or (record != observed and record.expires_at > self._now()):
                 return record
             try:

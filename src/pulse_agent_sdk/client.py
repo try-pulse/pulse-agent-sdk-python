@@ -89,6 +89,7 @@ class PulseAgentClient:
         self._retry_base = retry_base
         self._sleep = sleep
         self._stops = stops
+        self._identity: tuple[str, str, str] | None = None
 
     @classmethod
     async def for_event(
@@ -109,10 +110,12 @@ class PulseAgentClient:
             raise PermissionError("Pulse event does not match the active installation")
         if stops is not None and event.session_id is not None:
             stops.signal(event.session_id, installation.installation_id)
-        return cls(
+        client = cls(
             auth, installation.installation_id,
             max_retries=max_retries, retry_base=retry_base, sleep=sleep, stops=stops,
         )
+        client._identity = installation._identity
+        return client
 
     async def get_session(self, session_id: str) -> AgentSession:
         return cast(AgentSession, await self._request("GET", _session_path(session_id)))
@@ -327,17 +330,22 @@ class PulseAgentClient:
         if idempotency_key is not None:
             headers["Idempotency-Key"] = idempotency_key
         retryable = retryable or method != "POST"
-        refreshed = False
+        auth_retried = False
+        identity = self._identity
         rejected_token = None
         query = httpx.QueryParams(tuple(params or ()))
         retries = 0
         while True:
             try:
-                token = await self._auth.get_access_token(self._installation_id, rejected_token=rejected_token)
+                credential = await self._auth._get_access_record(
+                    self._installation_id, rejected_token=rejected_token, identity=identity,
+                )
             except InstallationRevokedError:
                 if self._stops is not None:
                     self._stops.stop_installation(self._installation_id)
                 raise
+            identity = credential._identity
+            token = credential.access_token
             rejected_token = None
             headers["Authorization"] = f"Bearer {token}"
             try:
@@ -376,12 +384,17 @@ class PulseAgentClient:
                     self._stops.note_session_ended(ended)
                 raise ended
             if status == 401 and code == "INSTALLATION_REVOKED":
-                if await self._auth._forget_rejected_token(self._installation_id, token) and self._stops is not None:
-                    self._stops.stop_installation(self._installation_id)
-                raise InstallationRevokedError(self._installation_id)
-            if status == 401 and not refreshed:
+                try:
+                    await self._auth._check_revoked_credential(credential)
+                except InstallationRevokedError:
+                    if self._stops is not None:
+                        self._stops.stop_installation(self._installation_id)
+                    raise
+                if auth_retried:
+                    raise PulseApiError(status, "credential_replaced")
+            if status == 401 and not auth_retried:
                 rejected_token = token
-                refreshed = True
+                auth_retried = True
                 continue
 
             delay = _retry_after(response)

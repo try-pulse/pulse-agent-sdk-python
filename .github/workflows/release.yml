@@ -1,6 +1,8 @@
 name: Release SDK
 
 on:
+  push:
+    tags: ['v*']
   workflow_dispatch:
     inputs:
       publish:
@@ -8,6 +10,14 @@ on:
         type: boolean
         required: true
         default: false
+      wheel_sha256:
+        description: Approved wheel SHA-256 (required for publishing)
+        type: string
+        required: false
+      sdist_sha256:
+        description: Approved sdist SHA-256 (required for publishing)
+        type: string
+        required: false
 
 permissions:
   contents: read
@@ -18,19 +28,46 @@ concurrency:
 
 jobs:
   check-ref:
+    if: github.event_name == 'workflow_dispatch' || (github.event.created && !github.event.deleted)
     runs-on: ubuntu-latest
+    outputs:
+      wheel_sha256: ${{ steps.digests.outputs.wheel }}
+      sdist_sha256: ${{ steps.digests.outputs.sdist }}
     steps:
       - name: Require a tag and the upstream repository for publishing
-        if: inputs.publish
+        if: github.event_name == 'push' || inputs.publish
         run: |
           test "$GITHUB_REPOSITORY" = try-pulse/pulse-agent-sdk-python
           test "$GITHUB_REF_TYPE" = tag
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name == 'push' || inputs.publish
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Resolve approved distribution digests
+        id: digests
+        if: github.event_name == 'push' || inputs.publish
+        env:
+          WHEEL_SHA256: ${{ inputs.wheel_sha256 }}
+          SDIST_SHA256: ${{ inputs.sdist_sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git merge-base --is-ancestor HEAD refs/remotes/origin/main
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            [[ "$GITHUB_REF_NAME" != */* ]]
+            manifest=".github/release-digests/${GITHUB_REF_NAME}.json"
+            WHEEL_SHA256=$(jq -er '.wheel_sha256' "$manifest")
+            SDIST_SHA256=$(jq -er '.sdist_sha256' "$manifest")
+          fi
+          [[ "$WHEEL_SHA256" =~ ^[a-f0-9]{64}$ && "$SDIST_SHA256" =~ ^[a-f0-9]{64}$ ]]
+          printf 'wheel=%s\nsdist=%s\n' "$WHEEL_SHA256" "$SDIST_SHA256" >> "$GITHUB_OUTPUT"
   verify:
     needs: check-ref
     uses: ./.github/workflows/ci.yml
   publish:
-    needs: verify
-    if: inputs.publish
+    needs: [check-ref, verify]
+    if: github.event_name == 'push' || inputs.publish
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: pypi
@@ -41,6 +78,19 @@ jobs:
         with:
           name: sdk-distributions
           path: dist
+      - name: Verify approved distribution digests
+        env:
+          WHEEL_SHA256: ${{ needs.check-ref.outputs.wheel_sha256 }}
+          SDIST_SHA256: ${{ needs.check-ref.outputs.sdist_sha256 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$WHEEL_SHA256" =~ ^[a-f0-9]{64}$ && "$SDIST_SHA256" =~ ^[a-f0-9]{64}$ ]]
+          wheels=(dist/*.whl)
+          sources=(dist/*.tar.gz)
+          files=(dist/*)
+          [[ ${#wheels[@]} -eq 1 && ${#sources[@]} -eq 1 && ${#files[@]} -eq 2 ]]
+          printf '%s  %s\n' "$WHEEL_SHA256" "${wheels[0]}" "$SDIST_SHA256" "${sources[0]}" | sha256sum -c -
       - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
         with:
           packages-dir: dist/
