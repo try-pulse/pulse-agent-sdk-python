@@ -1,15 +1,14 @@
 # Protocol parity
 
-Audited against the TypeScript SDK at `b2c37dc` and the local working-tree receiver, client, and OAuth changes. The [pinned OpenAPI snapshots](../specs/SOURCES.md) govern the HTTP contract. The tests exercise mocked HTTP and replay the shared signed delivery and resource-key vectors.
+This audit compares Python 0.1.2 with TypeScript commit [`8046b60ba49050bd04376ab338c0600bccbdc7ee`](https://github.com/try-pulse/pulse-agent-sdk/commit/8046b60ba49050bd04376ab338c0600bccbdc7ee). The [pinned OpenAPI snapshots](../specs/SOURCES.md) govern the HTTP contract. The [durable receiver](https://github.com/try-pulse/pulse-agent-sdk/blob/8046b60ba49050bd04376ab338c0600bccbdc7ee/packages/sdk/src/receiver.ts) verifies signed deliveries and awaits the application's inbox write before acknowledging them.
 
-Both resource vectors match the TypeScript working-tree files byte for byte at checkout revision `b2c37dc2a269a5d7364e8e580c6c578fc108f4be`. The files were untracked there, and no committed copy was found in the available TypeScript refs. Their immutable source is Python commit `3d542b41f8992cb185f0b1006f9675f30a1676b8`, verified against both working trees. A committed upstream TypeScript source remains unverified.
+All three Python fixtures match the [committed TypeScript fixtures](https://github.com/try-pulse/pulse-agent-sdk/tree/8046b60ba49050bd04376ab338c0600bccbdc7ee/fixtures) byte for byte. Both SDKs test the signed session delivery and the resource redelivery key.
 
 | Fixture | SHA-256 |
 | --- | --- |
+| `fixtures/agent-session-created.json` | `2d9a1198d969ed1bd43bdd6e6bfd55c6965687c16d9e7345b79d52b2c1913bf7` |
 | `fixtures/resource-webhook.json` | `b930a61f22c9d74b1a4b822649bd5a6e402ef239abedcc2fc9e82b1e152bbf1b` |
 | `fixtures/resource-webhook-key.json` | `08e23b302213fd30acf623507e658a323b92ad2dabdcc5245a0b320a573bcee0` |
-
-`fixtures/agent-session-created.json` reproduces the signed example from the committed `packages/sdk/test/_helpers.ts` at `b2c37dc`.
 
 | Wire operation or event | Python behavior and evidence |
 | --- | --- |
