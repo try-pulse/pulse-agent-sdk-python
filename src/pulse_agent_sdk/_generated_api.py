@@ -236,6 +236,26 @@ IssuePriority: TypeAlias = Literal['no_priority', 'urgent', 'high', 'medium', 'l
 IssueType: TypeAlias = Literal['bug', 'feature', 'task', 'story']
 
 
+class MessagingSource(TypedDict):
+    provider: Literal['slack', 'mattermost']
+    installation_id: ObjectId
+    external_org_key: str
+    destination_id: str
+    conversation_id: str
+    message_id: str
+    source_url: NotRequired[str]
+    display_name: NotRequired[str]
+    intake_profile_id: ObjectId
+    intake_profile_revision: int
+    template_id: ObjectId
+    template_revision: int
+
+
+class MessagingIntakeContent(TypedDict):
+    format: Literal['plate_json', 'markdown']
+    value: str
+
+
 DateTime: TypeAlias = str
 
 
@@ -342,6 +362,17 @@ class Milestone(TypedDict):
     updated_at: DateTime
 
 
+RequestPriority: TypeAlias = Literal['no_priority', 'urgent', 'high', 'medium', 'low']
+
+
+class MessagingExternalActor(TypedDict):
+    provider: Literal['slack', 'mattermost']
+    installation_id: ObjectId
+    external_org_key: str
+    external_actor_id: str
+    display_name: NotRequired[str]
+
+
 class CustomerCatalogValue(TypedDict):
     id: ObjectId
     workspace_id: NotRequired[str]
@@ -415,7 +446,10 @@ class RequestRef(TypedDict):
     title: str
     status: str
     type: str
-    priority: str
+    priority: RequestPriority
+
+
+DisplayNameStyle: TypeAlias = Literal['vice_city']
 
 
 AgentKind: TypeAlias = Literal['deployment', 'personal', 'app']
@@ -443,6 +477,7 @@ class User(TypedDict):
     last_name: NotRequired[str]
     job_title: NotRequired[str]
     display_name: NotRequired[str]
+    display_name_style: NotRequired[DisplayNameStyle]
     is_agent: NotRequired[bool]
     user_kind: NotRequired[Literal['human', 'application']]
     agent_kind: NotRequired[AgentKind]
@@ -478,15 +513,23 @@ KeyResultValueType: TypeAlias = Literal['number', 'percentage', 'currency', 'cus
 KeyResultStatus: TypeAlias = Literal['on_track', 'at_risk', 'off_track', 'completed']
 
 
+class BaseAvatar(TypedDict):
+    avatar_url: NotRequired[str]
+    avatar_urls: NotRequired[AvatarURLSet]
+
+
 class UserBasic(TypedDict):
     id: ObjectId
     email: str
     role: Literal['admin', 'user']
     status: Literal['active', 'blocked', 'pending']
+    display_name: NotRequired[str]
+    display_name_style: NotRequired[DisplayNameStyle]
     avatar_url: NotRequired[str | None]
     avatar_urls: NotRequired[AvatarURLSet]
+    base_avatar: NotRequired[BaseAvatar]
     avatar_status: NotRequired[Literal['pending', 'processing', 'processed'] | None]
-    team_memberships: list[TeamMembership]
+    team_memberships: NotRequired[list[TeamMembership]]
     teams: NotRequired[list[TeamBasic] | None]
     created_at: NotRequired[DateTime]
     updated_at: NotRequired[DateTime]
@@ -499,20 +542,49 @@ class UserBasic(TypedDict):
     agent_kind: NotRequired[AgentKind]
 
 
-class Metric(TypedDict):
-    id: ObjectId
-    name: str
-    description: NotRequired[str | None]
-    unit: str
-    current_value: float
-    last_updated_at: DateTime
-    owner_id: NotRequired[ObjectId | None]
-    team_id: NotRequired[ObjectId | None]
-    owner: NotRequired[UserBasic | None]
-    team: NotRequired[TeamBasic | None]
-    linked_key_results_count: NotRequired[int]
-    created_at: DateTime
-    updated_at: DateTime
+class MetricDefinitionFieldsFormat(TypedDict):
+    percent: NotRequired[bool]
+    decimals: NotRequired[int]
+    currency: NotRequired[str]
+    scale: NotRequired[float]
+
+
+class MetricDefinitionFieldsBounds(TypedDict):
+    min: NotRequired[float]
+    max: NotRequired[float]
+
+
+class MetricDefinitionFieldsAiContext(TypedDict):
+    synonyms: NotRequired[list[str]]
+    examples: NotRequired[list[str]]
+    notes: NotRequired[str]
+
+
+class MetricDefinitionFields(TypedDict):
+    numerator_metric_id: NotRequired[str | None]
+    denominator_metric_id: NotRequired[str | None]
+    unit_family: NotRequired[Literal['count', 'currency', 'percent', 'ratio', 'duration', 'bytes', 'custom'] | None]
+    format: NotRequired[MetricDefinitionFieldsFormat | None]
+    time_aggregation: NotRequired[Literal['sum', 'avg', 'min', 'max', 'last', 'recompute_ratio', 'ratio'] | None]
+    grain: NotRequired[Literal['hour', 'day', 'week', 'month'] | None]
+    timezone: NotRequired[str | None]
+    day_basis: NotRequired[Literal['event', 'cohort', 'scheduled', 'processing', 'settlement'] | None]
+    maturity_days: NotRequired[int | None]
+    bounds: NotRequired[MetricDefinitionFieldsBounds | None]
+    flatline_days: NotRequired[int | None]
+    jump_threshold: NotRequired[float | None]
+    system: NotRequired[str | None]
+    subarea: NotRequired[str | None]
+    source_ref: NotRequired[str | None]
+    ai_context: NotRequired[MetricDefinitionFieldsAiContext | None]
+    parent_metric_id: NotRequired[str | None]
+    segment_key: NotRequired[str | None]
+    segment_value: NotRequired[str | None]
+    segment_keys: NotRequired[list[str] | None]
+    drivers: NotRequired[list[str] | None]
+
+
+Metric: TypeAlias = MetricDefinitionFields
 
 
 MeasurementSource: TypeAlias = Literal['manual', 'metric', 'daily_snapshot']
@@ -554,6 +626,7 @@ ContentType: TypeAlias = Literal['link', 'document', 'image', 'video']
 
 class ContentBasic(TypedDict):
     id: ObjectId
+    workspace_id: NotRequired[ObjectId]
     title: str
     description: NotRequired[str | None]
     type: ContentType
@@ -562,6 +635,7 @@ class ContentBasic(TypedDict):
     direct_access_url: NotRequired[str | None]
     content_type: NotRequired[str | None]
     file_size: NotRequired[int | None]
+    is_editor_document: NotRequired[bool | None]
     checksum: NotRequired[str | None]
     tags: NotRequired[list[str]]
     is_public: NotRequired[bool]
@@ -616,6 +690,9 @@ ProjectPriority: TypeAlias = Literal['no_priority', 'urgent', 'high', 'medium', 
 ProjectHealthStatus: TypeAlias = Literal['on_track', 'off_track', 'at_risk']
 
 
+ProjectCalendarGranularity: TypeAlias = Literal['day', 'month', 'quarter', 'half_year', 'year']
+
+
 class ProjectBasic(TypedDict):
     id: ObjectId
     title: str
@@ -626,7 +703,9 @@ class ProjectBasic(TypedDict):
     icon_code: str
     icon_color: HexColor
     start_date: NotRequired[DateTime]
+    start_date_granularity: ProjectCalendarGranularity
     target_date: NotRequired[DateTime]
+    target_date_granularity: ProjectCalendarGranularity
     completed_at: NotRequired[DateTime]
     progress: NotRequired[int]
 
@@ -667,15 +746,21 @@ class Request(TypedDict):
     description: NotRequired[str]
     type: Literal['bug', 'feature', 'other']
     status: Literal['triage', 'pending', 'accepted', 'rejected', 'done', 'duplicate']
+    priority: RequestPriority
     team_id: ObjectId
-    requester_id: ObjectId
+    requester_id: NotRequired[ObjectId]
+    requester_kind: Literal['member', 'external']
+    external_actor_ref: NotRequired[MessagingExternalActor]
+    messaging_source: NotRequired[MessagingSource]
+    intake_content: NotRequired[MessagingIntakeContent]
     requester_team_id: NotRequired[ObjectId | None]
     key_result_ids: NotRequired[list[ObjectId]]
     project_ids: NotRequired[list[ObjectId]]
     issue_ids: NotRequired[list[ObjectId]]
+    workspace_id: NotRequired[ObjectId]
     customer_id: NotRequired[ObjectId | None]
     contact_id: NotRequired[ObjectId | None]
-    source: NotRequired[Literal['manual']]
+    source: NotRequired[Literal['manual', 'slack', 'mattermost']]
     external_reference: NotRequired[str | None]
     customer: NotRequired[Customer | None]
     contact: NotRequired[Contact | None]
@@ -807,6 +892,8 @@ class Issue(TypedDict):
     status: IssueStatus
     priority: IssuePriority
     type: IssueType
+    messaging_source: NotRequired[MessagingSource]
+    intake_content: NotRequired[MessagingIntakeContent]
     team_id: ObjectId
     project_id: NotRequired[ObjectId | None]
     milestone_id: NotRequired[ObjectId | None]
@@ -860,12 +947,13 @@ class MeResponseApp(TypedDict):
     name: str
 
 
-HomeViewType: TypeAlias = Literal['inbox', 'my_issues', 'all_issues', 'active_issues', 'current_cycle', 'projects', 'initiatives', 'favorite']
+HomeViewType: TypeAlias = Literal['inbox', 'my_issues', 'all_issues', 'active_issues', 'current_cycle', 'projects', 'initiatives', 'favorite', 'dashboard']
 
 
 class HomeViewSelection(TypedDict):
     type: HomeViewType
     favorite_id: NotRequired[str]
+    dashboard_id: NotRequired[str]
 
 
 HomeViewResponse = TypedDict("HomeViewResponse", {
